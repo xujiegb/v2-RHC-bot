@@ -1,0 +1,89 @@
+name: RPM release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version (for example, 0.2.0 or v0.2.0)
+        required: true
+        type: string
+permissions:
+  contents: write
+env:
+  RELEASE_VERSION: ${{ inputs.version || github.ref_name }}
+jobs:
+  build-ubi:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-26.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: registry.access.redhat.com/ubi10/ubi:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and package in Red Hat UBI 10
+        run: |
+          dnf install -y cargo rust rpm-build systemd-rpm-macros
+          cargo build --release
+          VERSION="${RELEASE_VERSION#v}"
+          test -n "$VERSION"
+          rpmbuild -bb packaging/rhc-bot.spec \
+            --define "version $VERSION" \
+            --define "binary $PWD/target/release/rhc-bot" \
+            --define "service $PWD/packaging/rhc-bot.service" \
+            --define "_rpmdir $PWD/dist"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpm-${{ matrix.arch }}
+          path: dist/**/*.rpm
+  build-riscv:
+    runs-on: ubuntu-24.04-riscv
+    container:
+      image: rockylinux/rockylinux:10
+    steps:
+      # actions/checkout runs its bundled Node.js before packages can be
+      # installed in the container.  That Node.js needs libatomic on riscv64,
+      # so bootstrap the dependency and checkout with git first.
+      - name: Bootstrap container and checkout
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          dnf install -y git libatomic
+          git init .
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --depth=1 origin "${GITHUB_SHA}"
+          git checkout --detach FETCH_HEAD
+          git remote set-url origin "https://github.com/${GITHUB_REPOSITORY}.git"
+      - run: uname -m
+      - name: Build and package in Rocky Linux 10
+        run: |
+          dnf install -y cargo rust rpm-build systemd-rpm-macros
+          cargo build --release
+          VERSION="${RELEASE_VERSION#v}"
+          test -n "$VERSION"
+          rpmbuild -bb packaging/rhc-bot.spec \
+            --define "version $VERSION" \
+            --define "binary $PWD/target/release/rhc-bot" \
+            --define "service $PWD/packaging/rhc-bot.service" \
+            --define "_rpmdir $PWD/dist"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpm-riscv64
+          path: dist/**/*.rpm
+  release:
+    needs: [build-ubi, build-riscv]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(env.RELEASE_VERSION, 'v') && env.RELEASE_VERSION || format('v{0}', env.RELEASE_VERSION) }}
+          files: artifacts/**/*.rpm
