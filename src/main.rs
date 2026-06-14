@@ -6,12 +6,14 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    fs,
+    fs::{self, OpenOptions},
     io::{self, Write},
     path::PathBuf,
+    process::Stdio,
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::{
+    io::AsyncWriteExt,
     process::Command,
     time::{sleep, Duration},
 };
@@ -39,6 +41,11 @@ struct Config {
     prompt: String,
     timeout_seconds: u64,
     image: String,
+    #[serde(default = "default_log_retention_days")]
+    log_retention_days: u64,
+}
+fn default_log_retention_days() -> u64 {
+    7
 }
 impl Default for Config {
     fn default() -> Self {
@@ -50,6 +57,7 @@ impl Default for Config {
             prompt: "请输入 rhc connect 命令。".into(),
             timeout_seconds: 600,
             image: "registry.access.redhat.com/ubi10/ubi:latest".into(),
+            log_retention_days: default_log_retention_days(),
         }
     }
 }
@@ -58,6 +66,33 @@ fn now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64
+}
+fn log(data: &PathBuf, message: &str) {
+    let dir = data.join("logs");
+    if fs::create_dir_all(&dir).is_ok() {
+        let path = dir.join(format!("{}.log", now() / 86_400));
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+            let _ = writeln!(file, "{} {}", now(), message);
+        }
+    }
+    eprintln!("{message}");
+}
+fn clean_logs(data: &PathBuf, retention_days: u64) {
+    let Ok(entries) = fs::read_dir(data.join("logs")) else {
+        return;
+    };
+    let cutoff = now().saturating_sub((retention_days.saturating_mul(86_400)) as i64);
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .trim_end_matches(".log")
+            .parse::<i64>()
+            .is_ok_and(|day| day * 86_400 < cutoff)
+        {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 fn paths(data: &PathBuf) -> (PathBuf, PathBuf) {
     (data.join("config.json"), data.join("state.db"))
@@ -73,8 +108,20 @@ fn db(data: &PathBuf) -> Result<Connection> {
     fs::create_dir_all(data)?;
     let (_, p) = paths(data);
     let c = Connection::open(p)?;
+    c.busy_timeout(std::time::Duration::from_secs(5))?;
     c.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS pending(user_id INTEGER,chat_id INTEGER,deadline INTEGER,failures INTEGER DEFAULT 0,busy INTEGER DEFAULT 0,PRIMARY KEY(user_id,chat_id));")?;
     Ok(c)
+}
+fn claim_slot(data: &PathBuf, user: i64, chat: i64, limit: u32) -> Result<bool> {
+    let mut c = db(data)?;
+    let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let changed = tx.execute(
+        "UPDATE pending SET busy=1 WHERE user_id=?1 AND chat_id=?2 AND busy=0
+         AND (SELECT count(*) FROM pending WHERE busy=1) < ?3",
+        params![user, chat, limit],
+    )?;
+    tx.commit()?;
+    Ok(changed == 1)
 }
 async fn api(client: &Client, token: &str, method: &str, body: Value) -> Result<Value> {
     let v: Value = client
@@ -149,7 +196,18 @@ async fn verify(
     org: String,
     fail: i64,
 ) -> Result<()> {
-    let status=Command::new("podman").args(["run","--rm","-e",&format!("KEY={key}"),"-e",&format!("ORG={org}"),&cfg.image,"bash","-lc","dnf -y install rhc subscription-manager >/dev/null && rhc connect --activation-key=\"$KEY\" --organization=\"$ORG\" >/dev/null && subscription-manager unregister >/dev/null"]).status().await;
+    let script = "dnf -y install rhc subscription-manager >/dev/null && read -r KEY && read -r ORG && rhc connect --activation-key=\"$KEY\" --organization=\"$ORG\" >/dev/null && subscription-manager unregister >/dev/null";
+    let mut child = Command::new("podman")
+        .args(["run", "--rm", "-i", &cfg.image, "bash", "-c", script])
+        .stdin(Stdio::piped())
+        .spawn()
+        .context("无法启动 podman")?;
+    let mut stdin = child.stdin.take().context("无法打开 podman stdin")?;
+    stdin
+        .write_all(format!("{key}\n{org}\n").as_bytes())
+        .await?;
+    drop(stdin);
+    let status = child.wait().await;
     if !matches!(status,Ok(s) if s.success()) {
         return reject(&data, &c, &cfg.token, user, chat, fail).await;
     }
@@ -159,10 +217,6 @@ async fn verify(
     )?;
     api(&c,&cfg.token,"restrictChatMember",json!({"chat_id":chat,"user_id":user,"permissions":{"can_send_messages":true,"can_send_audios":true,"can_send_documents":true,"can_send_photos":true,"can_send_videos":true,"can_send_video_notes":true,"can_send_voice_notes":true,"can_send_polls":true,"can_send_other_messages":true,"can_add_web_page_previews":true,"can_invite_users":true}})).await?;
     send(&c, &cfg.token, user, "验证成功").await;
-    let _ = Command::new("podman")
-        .args(["image", "rm", &cfg.image])
-        .status()
-        .await;
     Ok(())
 }
 async fn run(data: PathBuf) -> Result<()> {
@@ -184,6 +238,7 @@ async fn run(data: PathBuf) -> Result<()> {
     )?;
     loop {
         let cfg = load(&data)?;
+        clean_logs(&data, cfg.log_retention_days);
         {
             let d = db(&data)?;
             let mut st = d.prepare("SELECT user_id,chat_id FROM pending WHERE deadline<?")?;
@@ -203,13 +258,13 @@ async fn run(data: PathBuf) -> Result<()> {
             &client,
             &cfg.token,
             "getUpdates",
-            json!({"offset":offset,"timeout":50,"allowed_updates":["message"]}),
+            json!({"offset":offset,"timeout":10,"allowed_updates":["message"]}),
         )
         .await
         {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("poll: {e}");
+                log(&data, &format!("poll: {e:#}"));
                 sleep(Duration::from_secs(3)).await;
                 continue;
             }
@@ -297,11 +352,7 @@ async fn run(data: PathBuf) -> Result<()> {
                 reject(&data, &client, &cfg.token, uid, ch, fail).await?;
                 continue;
             };
-            let active: i64 =
-                db(&data)?.query_row("SELECT count(*) FROM pending WHERE busy=1", [], |r| {
-                    r.get(0)
-                })?;
-            if busy == 1 || active >= cfg.max_verifications as i64 {
+            if busy == 1 || !claim_slot(&data, uid, ch, cfg.max_verifications)? {
                 db(&data)?.execute(
                     "DELETE FROM pending WHERE user_id=? AND chat_id=?",
                     params![uid, ch],
@@ -323,21 +374,34 @@ async fn run(data: PathBuf) -> Result<()> {
                 .await;
                 continue;
             }
-            db(&data)?.execute(
-                "UPDATE pending SET busy=1 WHERE user_id=? AND chat_id=?",
-                params![uid, ch],
-            )?;
             send(&client, &cfg.token, uid, "正在验证").await;
-            tokio::spawn(verify(
-                data.clone(),
-                client.clone(),
-                cfg.clone(),
-                uid,
-                ch,
-                cap[1].into(),
-                cap[2].into(),
-                fail,
-            ));
+            let key = cap[1].to_owned();
+            let org = cap[2].to_owned();
+            let task_data = data.clone();
+            let task_client = client.clone();
+            let task_cfg = cfg.clone();
+            tokio::spawn(async move {
+                if let Err(e) = verify(
+                    task_data.clone(),
+                    task_client,
+                    task_cfg,
+                    uid,
+                    ch,
+                    key,
+                    org,
+                    fail,
+                )
+                .await
+                {
+                    log(&task_data, &format!("verify user={uid} chat={ch}: {e:#}"));
+                    if let Ok(d) = db(&task_data) {
+                        let _ = d.execute(
+                            "UPDATE pending SET busy=0 WHERE user_id=? AND chat_id=?",
+                            params![uid, ch],
+                        );
+                    }
+                }
+            });
         }
     }
 }
@@ -362,6 +426,7 @@ fn config(data: &PathBuf) -> Result<()> {
     ask!(prompt, "提问文案");
     ask!(timeout_seconds, "验证时长（秒）");
     ask!(image, "UBI 镜像");
+    ask!(log_retention_days, "日志保留天数");
     let (p, _) = paths(data);
     fs::write(&p, serde_json::to_vec_pretty(&c)?)?;
     Ok(())
