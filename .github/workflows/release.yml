@@ -46,7 +46,19 @@ jobs:
     container:
       image: rockylinux/rockylinux:10
     steps:
-      - uses: actions/checkout@v4
+      # actions/checkout runs its bundled Node.js before packages can be
+      # installed in the container.  That Node.js needs libatomic on riscv64,
+      # so bootstrap the dependency and checkout with git first.
+      - name: Bootstrap container and checkout
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          dnf install -y git libatomic
+          git init .
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git fetch --depth=1 origin "${GITHUB_SHA}"
+          git checkout --detach FETCH_HEAD
+          git remote set-url origin "https://github.com/${GITHUB_REPOSITORY}.git"
       - run: uname -m
       - name: Build and package in Rocky Linux 10
         run: |

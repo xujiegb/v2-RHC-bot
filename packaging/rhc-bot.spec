@@ -16,6 +16,9 @@ install -Dpm0644 %{service} %{buildroot}%{_unitdir}/rhc-bot.service
 %postun
 %systemd_postun_with_restart rhc-bot.service
 %files
-%license LICENSE
 %{_bindir}/rhc-bot
 %{_unitdir}/rhc-bot.service
+
+%changelog
+* Sun Jun 14 2026 rhc-bot maintainers - %{version}-1
+- Package the rhc-bot binary and systemd service
