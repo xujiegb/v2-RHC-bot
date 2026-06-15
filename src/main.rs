@@ -31,6 +31,7 @@ enum Action {
     Run,
     Config,
     Reset,
+    CacheUpdate,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Config {
@@ -41,8 +42,18 @@ struct Config {
     prompt: String,
     timeout_seconds: u64,
     image: String,
+    #[serde(default = "default_image_mode")]
+    image_mode: String,
+    #[serde(default = "default_cache_update_interval")]
+    cache_update_interval: String,
     #[serde(default = "default_log_retention_days")]
     log_retention_days: u64,
+}
+fn default_image_mode() -> String {
+    "live".into()
+}
+fn default_cache_update_interval() -> String {
+    "24h".into()
 }
 fn default_log_retention_days() -> u64 {
     7
@@ -57,6 +68,8 @@ impl Default for Config {
             prompt: "请输入 rhc connect 或 subscription-manager register 命令。\nEnter an rhc connect or subscription-manager register command.".into(),
             timeout_seconds: 600,
             image: "registry.access.redhat.com/ubi10/ubi:latest".into(),
+            image_mode: default_image_mode(),
+            cache_update_interval: default_cache_update_interval(),
             log_retention_days: default_log_retention_days(),
         }
     }
@@ -211,6 +224,61 @@ async fn reject(
     }
     Ok(())
 }
+fn interval_seconds(value: &str) -> Result<i64> {
+    let re = Regex::new(r"^([1-9][0-9]*)([hd])$")?;
+    let captures = re.captures(value).context("更新时间必须类似 21h 或 30d")?;
+    let number: i64 = captures[1].parse()?;
+    Ok(number * if &captures[2] == "h" { 3_600 } else { 86_400 })
+}
+async fn update_cached_image(data: &PathBuf, cfg: &Config, force: bool) -> Result<()> {
+    let marker = data.join("ubi-cache-updated");
+    let due = force
+        || fs::read_to_string(&marker)
+            .ok()
+            .and_then(|x| x.parse::<i64>().ok())
+            .is_none_or(|last| {
+                now() - last >= interval_seconds(&cfg.cache_update_interval).unwrap_or(86_400)
+            });
+    if due {
+        let status = Command::new("podman")
+            .args(["pull", &cfg.image])
+            .status()
+            .await?;
+        if !status.success() {
+            bail!("无法更新 UBI 缓存镜像")
+        }
+        fs::create_dir_all(data)?;
+        fs::write(marker, now().to_string())?;
+    }
+    Ok(())
+}
+async fn verification_image(
+    data: &PathBuf,
+    cfg: &Config,
+    user: i64,
+    chat: i64,
+) -> Result<(String, bool)> {
+    if cfg.image_mode == "live" {
+        let status = Command::new("podman")
+            .args(["pull", &cfg.image])
+            .status()
+            .await?;
+        if !status.success() {
+            bail!("无法实时拉取 UBI 镜像")
+        }
+        return Ok((cfg.image.clone(), false));
+    }
+    update_cached_image(data, cfg, false).await?;
+    let temporary = format!("localhost/rhc-bot-verify-{user}-{chat}-{}", now());
+    let status = Command::new("podman")
+        .args(["tag", &cfg.image, &temporary])
+        .status()
+        .await?;
+    if !status.success() {
+        bail!("无法复制本地 UBI 缓存镜像")
+    }
+    Ok((temporary, true))
+}
 async fn verify(
     data: PathBuf,
     c: Client,
@@ -224,8 +292,9 @@ async fn verify(
     // UBI 10 contains subscription-manager but not rhc. Both accepted input
     // syntaxes are normalized to this command, while credentials remain on stdin.
     let script = "read -r KEY && read -r ORG && trap 'subscription-manager unregister >/dev/null 2>&1 || true; subscription-manager clean >/dev/null 2>&1 || true' EXIT && subscription-manager register --activationkey=\"$KEY\" --org=\"$ORG\" >/dev/null";
+    let (image, remove_image) = verification_image(&data, &cfg, user, chat).await?;
     let mut child = Command::new("podman")
-        .args(["run", "--rm", "-i", &cfg.image, "bash", "-c", script])
+        .args(["run", "--rm", "-i", &image, "bash", "-c", script])
         .stdin(Stdio::piped())
         .spawn()
         .context("无法启动 podman")?;
@@ -235,6 +304,12 @@ async fn verify(
         .await?;
     drop(stdin);
     let status = child.wait().await;
+    if remove_image {
+        let _ = Command::new("podman")
+            .args(["image", "rm", &image])
+            .status()
+            .await;
+    }
     if !matches!(status,Ok(s) if s.success()) {
         return reject(&data, &c, &cfg.token, user, chat, fail).await;
     }
@@ -457,25 +532,62 @@ fn config(data: &PathBuf) -> Result<()> {
     c.prompt = c.prompt.replace("\\n", "\n");
     ask!(timeout_seconds, "验证时长（秒）");
     ask!(image, "UBI 镜像");
+    ask!(image_mode, "镜像模式（live 实时拉取/cache 本地缓存）");
+    if !matches!(c.image_mode.as_str(), "live" | "cache") {
+        bail!("镜像模式只能是 live 或 cache")
+    }
+    ask!(cache_update_interval, "缓存自动更新时间（例如 21h/30d）");
+    interval_seconds(&c.cache_update_interval)?;
     ask!(log_retention_days, "日志保留天数");
     let (p, _) = paths(data);
     fs::write(&p, serde_json::to_vec_pretty(&c)?)?;
     Ok(())
 }
+async fn menu(data: &PathBuf) -> Result<()> {
+    loop {
+        let c = load(data)?;
+        println!("\n\x1b[0;32mRHC Bot 管理界面\x1b[0m\n0. 退出\n1. 更改设置\n2. 查看当前设置\n3. 立即更新本地 UBI 缓存\n4. 重置验证数据\n\n镜像模式: {} | 缓存更新周期: {}", c.image_mode, c.cache_update_interval);
+        print!("请选择 [0-4]: ");
+        io::stdout().flush()?;
+        let mut value = String::new();
+        io::stdin().read_line(&mut value)?;
+        match value.trim() {
+            "0" => return Ok(()),
+            "1" => config(data)?,
+            "2" => println!("{}", serde_json::to_string_pretty(&c)?),
+            "3" => {
+                update_cached_image(data, &c, true).await?;
+                println!("本地 UBI 缓存已更新");
+            }
+            "4" => {
+                let (_, p) = paths(data);
+                if p.exists() {
+                    fs::remove_file(p)?;
+                }
+                println!("验证数据已重置");
+            }
+            _ => println!("输入无效"),
+        }
+    }
+}
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    match cli.command.unwrap_or(Action::Run) {
-        Action::Run => run(cli.data).await,
-        Action::Config => config(&cli.data),
-        Action::Reset => {
-            let (_, p) = paths(&cli.data);
-            if p.exists() {
-                fs::remove_file(p)?
+    match cli.command {
+        None => menu(&cli.data).await,
+        Some(action) => match action {
+            Action::Run => run(cli.data).await,
+            Action::Config => config(&cli.data),
+            Action::CacheUpdate => update_cached_image(&cli.data, &load(&cli.data)?, true).await,
+            Action::Reset => {
+                let (_, p) = paths(&cli.data);
+                if p.exists() {
+                    fs::remove_file(p)?
+                }
+                println!("数据已重置");
+                Ok(())
             }
-            println!("数据已重置");
-            Ok(())
-        }
+        },
     }
 }
 
