@@ -19,6 +19,7 @@ use tokio::{
 };
 
 const DEFAULT_DATA: &str = "/var/lib/rhc-bot";
+const SERVICE_NAME: &str = "rhc-bot.service";
 #[derive(Parser)]
 struct Cli {
     #[command(subcommand)]
@@ -32,6 +33,16 @@ enum Action {
     Config,
     Reset,
     CacheUpdate,
+    /// 启动 rhc-bot systemd 服务
+    Start,
+    /// 停止 rhc-bot systemd 服务
+    Stop,
+    /// 重启 rhc-bot systemd 服务
+    Restart,
+    /// 设置 rhc-bot 服务开机自启
+    Enable,
+    /// 关闭 rhc-bot 服务开机自启
+    Disable,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Config {
@@ -249,6 +260,17 @@ async fn update_cached_image(data: &PathBuf, cfg: &Config, force: bool) -> Resul
         }
         fs::create_dir_all(data)?;
         fs::write(marker, now().to_string())?;
+    }
+    Ok(())
+}
+async fn systemctl(action: &str) -> Result<()> {
+    let status = Command::new("systemctl")
+        .args([action, SERVICE_NAME])
+        .status()
+        .await
+        .with_context(|| format!("无法运行 systemctl {action}"))?;
+    if !status.success() {
+        bail!("systemctl {action} {SERVICE_NAME} 执行失败，请确认当前用户有管理服务的权限")
     }
     Ok(())
 }
@@ -546,8 +568,8 @@ fn config(data: &PathBuf) -> Result<()> {
 async fn menu(data: &PathBuf) -> Result<()> {
     loop {
         let c = load(data)?;
-        println!("\n\x1b[0;32mRHC Bot 管理界面\x1b[0m\n0. 退出\n1. 更改设置\n2. 查看当前设置\n3. 立即更新本地 UBI 缓存\n4. 重置验证数据\n\n镜像模式: {} | 缓存更新周期: {}", c.image_mode, c.cache_update_interval);
-        print!("请选择 [0-4]: ");
+        println!("\n\x1b[0;32mRHC Bot 管理界面\x1b[0m\n0. 退出\n1. 更改设置\n2. 查看当前设置\n3. 立即更新本地 UBI 缓存\n4. 重置验证数据\n5. 启动服务\n6. 停止服务\n7. 重启服务\n8. 设置开机自启\n9. 关闭开机自启\n\n镜像模式: {} | 缓存更新周期: {}", c.image_mode, c.cache_update_interval);
+        print!("请选择 [0-9]: ");
         io::stdout().flush()?;
         let mut value = String::new();
         io::stdin().read_line(&mut value)?;
@@ -566,6 +588,26 @@ async fn menu(data: &PathBuf) -> Result<()> {
                 }
                 println!("验证数据已重置");
             }
+            "5" => {
+                systemctl("start").await?;
+                println!("服务已启动");
+            }
+            "6" => {
+                systemctl("stop").await?;
+                println!("服务已停止");
+            }
+            "7" => {
+                systemctl("restart").await?;
+                println!("服务已重启");
+            }
+            "8" => {
+                systemctl("enable").await?;
+                println!("已设置开机自启");
+            }
+            "9" => {
+                systemctl("disable").await?;
+                println!("已关闭开机自启");
+            }
             _ => println!("输入无效"),
         }
     }
@@ -579,6 +621,11 @@ async fn main() -> Result<()> {
             Action::Run => run(cli.data).await,
             Action::Config => config(&cli.data),
             Action::CacheUpdate => update_cached_image(&cli.data, &load(&cli.data)?, true).await,
+            Action::Start => systemctl("start").await,
+            Action::Stop => systemctl("stop").await,
+            Action::Restart => systemctl("restart").await,
+            Action::Enable => systemctl("enable").await,
+            Action::Disable => systemctl("disable").await,
             Action::Reset => {
                 let (_, p) = paths(&cli.data);
                 if p.exists() {
@@ -626,5 +673,12 @@ mod tests {
             )),
             expected
         );
+    }
+
+    #[test]
+    fn parses_service_management_commands() {
+        for command in ["start", "stop", "restart", "enable", "disable"] {
+            assert!(Cli::try_parse_from(["rhc-bot", command]).is_ok());
+        }
     }
 }
