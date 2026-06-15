@@ -1,0 +1,11 @@
+[Unit]
+Description=RHC Telegram verification bot
+After=network-online.target
+Wants=network-online.target
+[Service]
+ExecStart=/usr/bin/rhc-bot run
+Restart=always
+RestartSec=5
+StateDirectory=rhc-bot
+[Install]
+WantedBy=multi-user.target
