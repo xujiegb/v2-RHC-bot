@@ -33,6 +33,11 @@ enum Action {
     Config,
     Reset,
     CacheUpdate,
+    /// 管理 Telegram 数字 ID 白名单
+    Whitelist {
+        #[command(subcommand)]
+        command: WhitelistAction,
+    },
     /// 启动 rhc-bot systemd 服务
     Start,
     /// 停止 rhc-bot systemd 服务
@@ -43,6 +48,19 @@ enum Action {
     Enable,
     /// 关闭 rhc-bot 服务开机自启
     Disable,
+}
+#[derive(Subcommand)]
+enum WhitelistAction {
+    /// 添加白名单 Telegram 数字 ID
+    Add { tg_id: i64 },
+    /// 删除指定 Telegram 数字 ID；不指定 ID 并加 --all 则删除全部
+    Delete {
+        tg_id: Option<i64>,
+        #[arg(long)]
+        all: bool,
+    },
+    /// 查询白名单 Telegram 数字 ID
+    List,
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct Config {
@@ -158,8 +176,38 @@ fn db(data: &PathBuf) -> Result<Connection> {
     let (_, p) = paths(data);
     let c = Connection::open(p)?;
     c.busy_timeout(std::time::Duration::from_secs(5))?;
-    c.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS pending(user_id INTEGER,chat_id INTEGER,deadline INTEGER,failures INTEGER DEFAULT 0,busy INTEGER DEFAULT 0,PRIMARY KEY(user_id,chat_id));")?;
+    c.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS pending(user_id INTEGER,chat_id INTEGER,deadline INTEGER,failures INTEGER DEFAULT 0,busy INTEGER DEFAULT 0,PRIMARY KEY(user_id,chat_id)); CREATE TABLE IF NOT EXISTS whitelist(tg_id INTEGER PRIMARY KEY,created_at INTEGER NOT NULL);")?;
     Ok(c)
+}
+fn is_whitelisted(data: &PathBuf, tg_id: i64) -> Result<bool> {
+    let c = db(data)?;
+    let count: i64 = c.query_row(
+        "SELECT count(*) FROM whitelist WHERE tg_id=?1",
+        [tg_id],
+        |r| r.get(0),
+    )?;
+    Ok(count > 0)
+}
+fn whitelist_add(data: &PathBuf, tg_id: i64) -> Result<()> {
+    db(data)?.execute(
+        "INSERT OR REPLACE INTO whitelist(tg_id,created_at) VALUES(?1,?2)",
+        params![tg_id, now()],
+    )?;
+    Ok(())
+}
+fn whitelist_delete(data: &PathBuf, tg_id: i64) -> Result<usize> {
+    Ok(db(data)?.execute("DELETE FROM whitelist WHERE tg_id=?1", [tg_id])?)
+}
+fn whitelist_clear(data: &PathBuf) -> Result<usize> {
+    Ok(db(data)?.execute("DELETE FROM whitelist", [])?)
+}
+fn whitelist_list(data: &PathBuf) -> Result<Vec<i64>> {
+    let c = db(data)?;
+    let mut st = c.prepare("SELECT tg_id FROM whitelist ORDER BY tg_id")?;
+    let ids = st
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<i64>>>()?;
+    Ok(ids)
 }
 fn claim_slot(data: &PathBuf, user: i64, chat: i64, limit: u32) -> Result<bool> {
     let mut c = db(data)?;
@@ -435,6 +483,17 @@ async fn run(data: PathBuf) -> Result<()> {
                     continue;
                 }
                 let uid = member["id"].as_i64().unwrap();
+                if is_whitelisted(&data, uid)? {
+                    let welcome = welcome_text(&cfg.welcome, member);
+                    api(
+                        &client,
+                        &cfg.token,
+                        "sendMessage",
+                        json!({"chat_id":chat,"text":welcome}),
+                    )
+                    .await?;
+                    continue;
+                }
                 db(&data)?.execute(
                     "INSERT OR REPLACE INTO pending VALUES(?,?,?,?,0)",
                     params![uid, chat, now() + cfg.timeout_seconds as i64, 0],
@@ -568,8 +627,8 @@ fn config(data: &PathBuf) -> Result<()> {
 async fn menu(data: &PathBuf) -> Result<()> {
     loop {
         let c = load(data)?;
-        println!("\n\x1b[0;32mRHC Bot 管理界面\x1b[0m\n0. 退出\n1. 更改设置\n2. 查看当前设置\n3. 立即更新本地 UBI 缓存\n4. 重置验证数据\n5. 启动服务\n6. 停止服务\n7. 重启服务\n8. 设置开机自启\n9. 关闭开机自启\n\n镜像模式: {} | 缓存更新周期: {}", c.image_mode, c.cache_update_interval);
-        print!("请选择 [0-9]: ");
+        println!("\n\x1b[0;32mRHC Bot 管理界面\x1b[0m\n0. 退出\n1. 更改设置\n2. 查看当前设置\n3. 立即更新本地 UBI 缓存\n4. 重置验证数据\n5. 启动服务\n6. 停止服务\n7. 重启服务\n8. 设置开机自启\n9. 关闭开机自启\n10. 添加白名单 TG ID\n11. 删除白名单 TG ID\n12. 查询白名单 TG ID\n13. 删除全部白名单 TG ID\n\n镜像模式: {} | 缓存更新周期: {}", c.image_mode, c.cache_update_interval);
+        print!("请选择 [0-13]: ");
         io::stdout().flush()?;
         let mut value = String::new();
         io::stdin().read_line(&mut value)?;
@@ -608,9 +667,46 @@ async fn menu(data: &PathBuf) -> Result<()> {
                 systemctl("disable").await?;
                 println!("已关闭开机自启");
             }
+            "10" => {
+                let tg_id = read_tg_id("请输入要添加的 Telegram 数字 ID: ")?;
+                whitelist_add(data, tg_id)?;
+                println!("已添加白名单 TG ID: {tg_id}");
+            }
+            "11" => {
+                let tg_id = read_tg_id("请输入要删除的 Telegram 数字 ID: ")?;
+                let deleted = whitelist_delete(data, tg_id)?;
+                if deleted == 0 {
+                    println!("白名单中没有 TG ID: {tg_id}");
+                } else {
+                    println!("已删除白名单 TG ID: {tg_id}");
+                }
+            }
+            "12" => print_whitelist(data)?,
+            "13" => {
+                let deleted = whitelist_clear(data)?;
+                println!("已删除全部白名单 TG ID，共 {deleted} 个");
+            }
             _ => println!("输入无效"),
         }
     }
+}
+fn read_tg_id(prompt: &str) -> Result<i64> {
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let mut s = String::new();
+    io::stdin().read_line(&mut s)?;
+    s.trim().parse().context("请输入 Telegram 数字 ID")
+}
+fn print_whitelist(data: &PathBuf) -> Result<()> {
+    let ids = whitelist_list(data)?;
+    if ids.is_empty() {
+        println!("白名单为空");
+    } else {
+        for id in ids {
+            println!("{id}");
+        }
+    }
+    Ok(())
 }
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -621,6 +717,30 @@ async fn main() -> Result<()> {
             Action::Run => run(cli.data).await,
             Action::Config => config(&cli.data),
             Action::CacheUpdate => update_cached_image(&cli.data, &load(&cli.data)?, true).await,
+            Action::Whitelist { command } => match command {
+                WhitelistAction::Add { tg_id } => {
+                    whitelist_add(&cli.data, tg_id)?;
+                    println!("已添加白名单 TG ID: {tg_id}");
+                    Ok(())
+                }
+                WhitelistAction::Delete { tg_id, all } => {
+                    if all {
+                        let deleted = whitelist_clear(&cli.data)?;
+                        println!("已删除全部白名单 TG ID，共 {deleted} 个");
+                    } else if let Some(tg_id) = tg_id {
+                        let deleted = whitelist_delete(&cli.data, tg_id)?;
+                        if deleted == 0 {
+                            println!("白名单中没有 TG ID: {tg_id}");
+                        } else {
+                            println!("已删除白名单 TG ID: {tg_id}");
+                        }
+                    } else {
+                        bail!("请提供要删除的 Telegram 数字 ID，或使用 --all 删除全部")
+                    }
+                    Ok(())
+                }
+                WhitelistAction::List => print_whitelist(&cli.data),
+            },
             Action::Start => systemctl("start").await,
             Action::Stop => systemctl("stop").await,
             Action::Restart => systemctl("restart").await,
@@ -680,5 +800,27 @@ mod tests {
         for command in ["start", "stop", "restart", "enable", "disable"] {
             assert!(Cli::try_parse_from(["rhc-bot", command]).is_ok());
         }
+    }
+
+    #[test]
+    fn parses_whitelist_commands() {
+        assert!(Cli::try_parse_from(["rhc-bot", "whitelist", "add", "123456"]).is_ok());
+        assert!(Cli::try_parse_from(["rhc-bot", "whitelist", "delete", "123456"]).is_ok());
+        assert!(Cli::try_parse_from(["rhc-bot", "whitelist", "delete", "--all"]).is_ok());
+        assert!(Cli::try_parse_from(["rhc-bot", "whitelist", "list"]).is_ok());
+    }
+
+    #[test]
+    fn manages_whitelist_tg_ids() {
+        let data = std::env::temp_dir().join(format!("rhc-bot-test-{}", now()));
+        whitelist_add(&data, 123456).unwrap();
+        whitelist_add(&data, 987654).unwrap();
+        assert!(is_whitelisted(&data, 123456).unwrap());
+        assert_eq!(whitelist_list(&data).unwrap(), vec![123456, 987654]);
+        assert_eq!(whitelist_delete(&data, 123456).unwrap(), 1);
+        assert!(!is_whitelisted(&data, 123456).unwrap());
+        assert_eq!(whitelist_clear(&data).unwrap(), 1);
+        assert!(whitelist_list(&data).unwrap().is_empty());
+        let _ = fs::remove_dir_all(data);
     }
 }
