@@ -68,6 +68,8 @@ struct Config {
     max_verifications: u32,
     #[serde(default = "default_max_failures")]
     max_failures: u32,
+    #[serde(default = "default_capacity_action")]
+    capacity_action: String,
     welcome: String,
     button: String,
     prompt: String,
@@ -82,6 +84,9 @@ struct Config {
 }
 fn default_max_failures() -> u32 {
     2
+}
+fn default_capacity_action() -> String {
+    "kick".into()
 }
 fn default_image_mode() -> String {
     "live".into()
@@ -98,6 +103,7 @@ impl Default for Config {
             token: "".into(),
             max_verifications: 2,
             max_failures: default_max_failures(),
+            capacity_action: default_capacity_action(),
             welcome: "欢迎新成员，请在 10 分钟内私聊完成验证。\nWelcome. Please complete verification by private message within 10 minutes.".into(),
             button: "开始验证".into(),
             prompt: "请输入 rhc connect 或 subscription-manager register 命令。\nEnter an rhc connect or subscription-manager register command.".into(),
@@ -637,8 +643,10 @@ async fn run(data: PathBuf) -> Result<()> {
                     )
                     .await;
                 }
-                ban(&client, &cfg.token, ch, uid).await;
-                if join_request == 0 {
+                if cfg.capacity_action == "ban" || join_request == 0 {
+                    ban(&client, &cfg.token, ch, uid).await;
+                }
+                if cfg.capacity_action == "kick" && join_request == 0 {
                     let _ = api(
                         &client,
                         &cfg.token,
@@ -709,6 +717,13 @@ fn config(data: &PathBuf) -> Result<()> {
     ask!(token, "Bot token");
     ask!(max_verifications, "同时验证人数");
     ask!(max_failures, "验证失败次数上限");
+    ask!(
+        capacity_action,
+        "超过同时验证人数的处理（kick 踢出/ban 封禁）"
+    );
+    if !matches!(c.capacity_action.as_str(), "kick" | "ban") {
+        bail!("超过同时验证人数的处理只能是 kick 或 ban")
+    }
     ask!(welcome, "群欢迎语（支持 {fullname}，使用 \\n 换行）");
     c.welcome = c.welcome.replace("\\n", "\n");
     ask!(button, "按钮文案");
@@ -878,6 +893,22 @@ mod tests {
     fn prompt_config_supports_escaped_newlines() {
         let prompt = r"请输入验证命令。\nEnter the verification command.".replace("\\n", "\n");
         assert_eq!(prompt, "请输入验证命令。\nEnter the verification command.");
+    }
+
+    #[test]
+    fn config_defaults_capacity_action_to_kick() {
+        let cfg: Config = serde_json::from_value(json!({
+            "token": "123:test",
+            "max_verifications": 2,
+            "welcome": "welcome",
+            "button": "verify",
+            "prompt": "prompt",
+            "timeout_seconds": 600,
+            "image": "registry.access.redhat.com/ubi10/ubi:latest"
+        }))
+        .unwrap();
+        assert_eq!(cfg.capacity_action, "kick");
+        assert_eq!(cfg.max_failures, 2);
     }
 
     #[test]
