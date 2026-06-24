@@ -66,6 +66,8 @@ enum WhitelistAction {
 struct Config {
     token: String,
     max_verifications: u32,
+    #[serde(default = "default_max_failures")]
+    max_failures: u32,
     welcome: String,
     button: String,
     prompt: String,
@@ -77,6 +79,9 @@ struct Config {
     cache_update_interval: String,
     #[serde(default = "default_log_retention_days")]
     log_retention_days: u64,
+}
+fn default_max_failures() -> u32 {
+    2
 }
 fn default_image_mode() -> String {
     "live".into()
@@ -92,6 +97,7 @@ impl Default for Config {
         Self {
             token: "".into(),
             max_verifications: 2,
+            max_failures: default_max_failures(),
             welcome: "欢迎新成员，请在 10 分钟内私聊完成验证。\nWelcome. Please complete verification by private message within 10 minutes.".into(),
             button: "开始验证".into(),
             prompt: "请输入 rhc connect 或 subscription-manager register 命令。\nEnter an rhc connect or subscription-manager register command.".into(),
@@ -176,7 +182,11 @@ fn db(data: &PathBuf) -> Result<Connection> {
     let (_, p) = paths(data);
     let c = Connection::open(p)?;
     c.busy_timeout(std::time::Duration::from_secs(5))?;
-    c.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS pending(user_id INTEGER,chat_id INTEGER,deadline INTEGER,failures INTEGER DEFAULT 0,busy INTEGER DEFAULT 0,PRIMARY KEY(user_id,chat_id)); CREATE TABLE IF NOT EXISTS whitelist(tg_id INTEGER PRIMARY KEY,created_at INTEGER NOT NULL);")?;
+    c.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS pending(user_id INTEGER,chat_id INTEGER,deadline INTEGER,failures INTEGER DEFAULT 0,busy INTEGER DEFAULT 0,join_request INTEGER DEFAULT 0,PRIMARY KEY(user_id,chat_id)); CREATE TABLE IF NOT EXISTS whitelist(tg_id INTEGER PRIMARY KEY,created_at INTEGER NOT NULL);")?;
+    let _ = c.execute(
+        "ALTER TABLE pending ADD COLUMN join_request INTEGER DEFAULT 0",
+        [],
+    );
     Ok(c)
 }
 fn is_whitelisted(data: &PathBuf, tg_id: i64) -> Result<bool> {
@@ -266,14 +276,25 @@ async fn reject(
     user: i64,
     chat: i64,
     fail: i64,
+    max_failures: u32,
+    join_request: bool,
 ) -> Result<()> {
     send(c, t, user, "验证失败\nVerification failed").await;
     let d = db(data)?;
-    if fail + 1 >= 2 {
+    if fail + 1 >= i64::from(max_failures) {
         d.execute(
             "DELETE FROM pending WHERE user_id=? AND chat_id=?",
             params![user, chat],
         )?;
+        if join_request {
+            let _ = api(
+                c,
+                t,
+                "declineChatJoinRequest",
+                json!({"chat_id":chat,"user_id":user}),
+            )
+            .await;
+        }
         ban(c, t, chat, user).await
     } else {
         d.execute(
@@ -358,6 +379,7 @@ async fn verify(
     key: String,
     org: String,
     fail: i64,
+    join_request: bool,
 ) -> Result<()> {
     // UBI 10 contains subscription-manager but not rhc. Both accepted input
     // syntaxes are normalized to this command, while credentials remain on stdin.
@@ -381,13 +403,33 @@ async fn verify(
             .await;
     }
     if !matches!(status,Ok(s) if s.success()) {
-        return reject(&data, &c, &cfg.token, user, chat, fail).await;
+        return reject(
+            &data,
+            &c,
+            &cfg.token,
+            user,
+            chat,
+            fail,
+            cfg.max_failures,
+            join_request,
+        )
+        .await;
     }
     db(&data)?.execute(
         "DELETE FROM pending WHERE user_id=? AND chat_id=?",
         params![user, chat],
     )?;
-    api(&c,&cfg.token,"restrictChatMember",json!({"chat_id":chat,"user_id":user,"permissions":{"can_send_messages":true,"can_send_audios":true,"can_send_documents":true,"can_send_photos":true,"can_send_videos":true,"can_send_video_notes":true,"can_send_voice_notes":true,"can_send_polls":true,"can_send_other_messages":true,"can_add_web_page_previews":true,"can_invite_users":true}})).await?;
+    if join_request {
+        api(
+            &c,
+            &cfg.token,
+            "approveChatJoinRequest",
+            json!({"chat_id":chat,"user_id":user}),
+        )
+        .await?;
+    } else {
+        api(&c,&cfg.token,"restrictChatMember",json!({"chat_id":chat,"user_id":user,"permissions":{"can_send_messages":true,"can_send_audios":true,"can_send_documents":true,"can_send_photos":true,"can_send_videos":true,"can_send_video_notes":true,"can_send_voice_notes":true,"can_send_polls":true,"can_send_other_messages":true,"can_add_web_page_previews":true,"can_invite_users":true}})).await?;
+    }
     send(&c, &cfg.token, user, "验证成功\nVerification successful").await;
     Ok(())
 }
@@ -410,16 +452,26 @@ async fn run(data: PathBuf) -> Result<()> {
         clean_logs(&data, cfg.log_retention_days);
         {
             let d = db(&data)?;
-            let mut st = d.prepare("SELECT user_id,chat_id FROM pending WHERE deadline<?")?;
+            let mut st =
+                d.prepare("SELECT user_id,chat_id,join_request FROM pending WHERE deadline<?")?;
             let rows = st
-                .query_map([now()], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect::<rusqlite::Result<Vec<(i64, i64)>>>()?;
+                .query_map([now()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<Vec<(i64, i64, i64)>>>()?;
             drop(st);
-            for (u, ch) in rows {
+            for (u, ch, join_request) in rows {
                 d.execute(
                     "DELETE FROM pending WHERE user_id=? AND chat_id=?",
                     params![u, ch],
                 )?;
+                if join_request == 1 {
+                    let _ = api(
+                        &client,
+                        &cfg.token,
+                        "declineChatJoinRequest",
+                        json!({"chat_id":ch,"user_id":u}),
+                    )
+                    .await;
+                }
                 ban(&client, &cfg.token, ch, u).await;
             }
         }
@@ -427,7 +479,7 @@ async fn run(data: PathBuf) -> Result<()> {
             &client,
             &cfg.token,
             "getUpdates",
-            json!({"offset":offset,"timeout":10,"allowed_updates":["message"]}),
+            json!({"offset":offset,"timeout":10,"allowed_updates":["message","chat_join_request"]}),
         )
         .await
         {
@@ -440,6 +492,34 @@ async fn run(data: PathBuf) -> Result<()> {
         };
         for u in updates.as_array().unwrap_or(&vec![]) {
             offset = u["update_id"].as_i64().unwrap_or(0) + 1;
+            if let Some(request) = u.get("chat_join_request").filter(|v| !v.is_null()) {
+                let chat = request["chat"]["id"].as_i64().unwrap_or(0);
+                let user = &request["from"];
+                let uid = user["id"].as_i64().unwrap_or(0);
+                if uid == 0
+                    || !is_chat_admin(&client, &cfg.token, chat, bot_id)
+                        .await
+                        .unwrap_or(false)
+                {
+                    continue;
+                }
+                if is_whitelisted(&data, uid)? {
+                    let _ = api(
+                        &client,
+                        &cfg.token,
+                        "approveChatJoinRequest",
+                        json!({"chat_id":chat,"user_id":uid}),
+                    )
+                    .await;
+                    continue;
+                }
+                db(&data)?.execute(
+                    "INSERT OR REPLACE INTO pending(user_id,chat_id,deadline,failures,busy,join_request) VALUES(?,?,?,?,0,1)",
+                    params![uid, chat, now() + cfg.timeout_seconds as i64, 0],
+                )?;
+                send(&client, &cfg.token, uid, &cfg.prompt).await;
+                continue;
+            }
             let m = &u["message"];
             let chat = m["chat"]["id"].as_i64().unwrap_or(0);
             let bot_was_added = m["new_chat_members"].as_array().is_some_and(|members| {
@@ -495,7 +575,7 @@ async fn run(data: PathBuf) -> Result<()> {
                     continue;
                 }
                 db(&data)?.execute(
-                    "INSERT OR REPLACE INTO pending VALUES(?,?,?,?,0)",
+                    "INSERT OR REPLACE INTO pending(user_id,chat_id,deadline,failures,busy,join_request) VALUES(?,?,?,?,0,0)",
                     params![uid, chat, now() + cfg.timeout_seconds as i64, 0],
                 )?;
                 api(&client,&cfg.token,"restrictChatMember",json!({"chat_id":chat,"user_id":uid,"permissions":{"can_send_messages":false},"until_date":now()+cfg.timeout_seconds as i64})).await?;
@@ -509,7 +589,7 @@ async fn run(data: PathBuf) -> Result<()> {
             let text = m["text"].as_str().unwrap_or("");
             let row = {
                 let d = db(&data)?;
-                let x=d.query_row("SELECT chat_id,failures,busy FROM pending WHERE user_id=? ORDER BY deadline DESC",[uid],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?))).ok();
+                let x=d.query_row("SELECT chat_id,failures,busy,join_request FROM pending WHERE user_id=? ORDER BY deadline DESC",[uid],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?))).ok();
                 x
             };
             if text.starts_with("/start") {
@@ -526,11 +606,21 @@ async fn run(data: PathBuf) -> Result<()> {
                 .await;
                 continue;
             }
-            let Some((ch, fail, busy)) = row else {
+            let Some((ch, fail, busy, join_request)) = row else {
                 continue;
             };
             let Some((key, org)) = verification_credentials(text) else {
-                reject(&data, &client, &cfg.token, uid, ch, fail).await?;
+                reject(
+                    &data,
+                    &client,
+                    &cfg.token,
+                    uid,
+                    ch,
+                    fail,
+                    cfg.max_failures,
+                    join_request == 1,
+                )
+                .await?;
                 continue;
             };
             if busy == 1 || !claim_slot(&data, uid, ch, cfg.max_verifications)? {
@@ -538,14 +628,25 @@ async fn run(data: PathBuf) -> Result<()> {
                     "DELETE FROM pending WHERE user_id=? AND chat_id=?",
                     params![uid, ch],
                 )?;
+                if join_request == 1 {
+                    let _ = api(
+                        &client,
+                        &cfg.token,
+                        "declineChatJoinRequest",
+                        json!({"chat_id":ch,"user_id":uid}),
+                    )
+                    .await;
+                }
                 ban(&client, &cfg.token, ch, uid).await;
-                let _ = api(
-                    &client,
-                    &cfg.token,
-                    "unbanChatMember",
-                    json!({"chat_id":ch,"user_id":uid,"only_if_banned":true}),
-                )
-                .await;
+                if join_request == 0 {
+                    let _ = api(
+                        &client,
+                        &cfg.token,
+                        "unbanChatMember",
+                        json!({"chat_id":ch,"user_id":uid,"only_if_banned":true}),
+                    )
+                    .await;
+                }
                 send(
                     &client,
                     &cfg.token,
@@ -575,6 +676,7 @@ async fn run(data: PathBuf) -> Result<()> {
                     key,
                     org,
                     fail,
+                    join_request == 1,
                 )
                 .await
                 {
@@ -606,6 +708,7 @@ fn config(data: &PathBuf) -> Result<()> {
     }
     ask!(token, "Bot token");
     ask!(max_verifications, "同时验证人数");
+    ask!(max_failures, "验证失败次数上限");
     ask!(welcome, "群欢迎语（支持 {fullname}，使用 \\n 换行）");
     c.welcome = c.welcome.replace("\\n", "\n");
     ask!(button, "按钮文案");
