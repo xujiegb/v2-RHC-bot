@@ -82,9 +82,28 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          path: artifacts
-          merge-multiple: true
-      - uses: softprops/action-gh-release@v2
+          name: rpm-x86_64
+          path: artifacts/x86_64
+      - uses: actions/download-artifact@v4
+        with:
+          name: rpm-aarch64
+          path: artifacts/aarch64
+      - uses: actions/download-artifact@v4
+        with:
+          name: rpm-riscv64
+          path: artifacts/riscv64
+      - name: Upload x86_64 RPMs
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ startsWith(env.RELEASE_VERSION, 'v') && env.RELEASE_VERSION || format('v{0}', env.RELEASE_VERSION) }}
-          files: artifacts/**/*.rpm
+          files: artifacts/x86_64/**/*.rpm
+      - name: Upload aarch64 RPMs
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(env.RELEASE_VERSION, 'v') && env.RELEASE_VERSION || format('v{0}', env.RELEASE_VERSION) }}
+          files: artifacts/aarch64/**/*.rpm
+      - name: Upload riscv64 RPMs
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(env.RELEASE_VERSION, 'v') && env.RELEASE_VERSION || format('v{0}', env.RELEASE_VERSION) }}
+          files: artifacts/riscv64/**/*.rpm
