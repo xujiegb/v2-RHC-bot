@@ -76,15 +76,42 @@ jobs:
         with:
           name: rpm-riscv64
           path: dist/**/*.rpm
-  release:
-    needs: [build-ubi, build-riscv]
+  upload-x86_64:
+    needs: build-ubi
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
+          name: rpm-x86_64
           path: artifacts
-          merge-multiple: true
-      - uses: softprops/action-gh-release@v2
+      - name: Upload x86_64 RPMs
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(env.RELEASE_VERSION, 'v') && env.RELEASE_VERSION || format('v{0}', env.RELEASE_VERSION) }}
+          files: artifacts/**/*.rpm
+  upload-aarch64:
+    needs: build-ubi
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: rpm-aarch64
+          path: artifacts
+      - name: Upload aarch64 RPMs
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(env.RELEASE_VERSION, 'v') && env.RELEASE_VERSION || format('v{0}', env.RELEASE_VERSION) }}
+          files: artifacts/**/*.rpm
+  upload-riscv64:
+    needs: build-riscv
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: rpm-riscv64
+          path: artifacts
+      - name: Upload riscv64 RPMs
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ startsWith(env.RELEASE_VERSION, 'v') && env.RELEASE_VERSION || format('v{0}', env.RELEASE_VERSION) }}
           files: artifacts/**/*.rpm
