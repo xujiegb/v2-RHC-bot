@@ -13,20 +13,13 @@ permissions:
 env:
   RELEASE_VERSION: ${{ inputs.version || github.ref_name }}
 jobs:
-  build-ubi:
-    strategy:
-      matrix:
-        include:
-          - arch: x86_64
-            runner: ubuntu-26.04
-          - arch: aarch64
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
+  build-x86_64:
+    runs-on: ubuntu-26.04
     container:
       image: registry.access.redhat.com/ubi10/ubi:latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build and package in Red Hat UBI 10
+      - name: Build and package x86_64 in Red Hat UBI 10
         run: |
           dnf install -y cargo rust rpm-build systemd-rpm-macros
           cargo build --release
@@ -39,15 +32,36 @@ jobs:
             --define "_rpmdir $PWD/dist"
       - uses: actions/upload-artifact@v4
         with:
-          name: rpm-${{ matrix.arch }}
+          name: rpm-x86_64
           path: dist/**/*.rpm
-  build-riscv:
+  build-aarch64:
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: registry.access.redhat.com/ubi10/ubi:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and package aarch64 in Red Hat UBI 10
+        run: |
+          dnf install -y cargo rust rpm-build systemd-rpm-macros
+          cargo build --release
+          VERSION="${RELEASE_VERSION#v}"
+          test -n "$VERSION"
+          rpmbuild -bb packaging/rhc-bot.spec \
+            --define "version $VERSION" \
+            --define "binary $PWD/target/release/rhc-bot" \
+            --define "service $PWD/packaging/rhc-bot.service" \
+            --define "_rpmdir $PWD/dist"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpm-aarch64
+          path: dist/**/*.rpm
+  build-riscv64:
     runs-on: ubuntu-24.04-riscv
     container:
       image: rockylinux/rockylinux:10
     steps:
       # actions/checkout runs its bundled Node.js before packages can be
-      # installed in the container.  That Node.js needs libatomic on riscv64,
+      # installed in the container. That Node.js needs libatomic on riscv64,
       # so bootstrap the dependency and checkout with git first.
       - name: Bootstrap container and checkout
         env:
@@ -61,7 +75,7 @@ jobs:
           git checkout --detach FETCH_HEAD
           git remote set-url origin "https://github.com/${GITHUB_REPOSITORY}.git"
       - run: uname -m
-      - name: Build and package in Rocky Linux 10
+      - name: Build and package riscv64 in Rocky Linux 10
         run: |
           dnf install -y cargo rust rpm-build systemd-rpm-macros
           cargo build --release
@@ -76,15 +90,54 @@ jobs:
         with:
           name: rpm-riscv64
           path: dist/**/*.rpm
-  release:
-    needs: [build-ubi, build-riscv]
+  upload-x86_64:
+    needs: build-x86_64
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
+          name: rpm-x86_64
           path: artifacts
-          merge-multiple: true
-      - uses: softprops/action-gh-release@v2
+      - name: Upload x86_64 RPMs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ startsWith(env.RELEASE_VERSION, 'v') && env.RELEASE_VERSION || format('v{0}', env.RELEASE_VERSION) }}
+        run: |
+          gh release view "$TAG_NAME" >/dev/null 2>&1 || \
+            gh release create "$TAG_NAME" --target "$GITHUB_SHA" --title "$TAG_NAME" --generate-notes || \
+            gh release view "$TAG_NAME" >/dev/null
+          gh release upload "$TAG_NAME" artifacts/**/*.rpm --clobber
+  upload-aarch64:
+    needs: build-aarch64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
         with:
-          tag_name: ${{ startsWith(env.RELEASE_VERSION, 'v') && env.RELEASE_VERSION || format('v{0}', env.RELEASE_VERSION) }}
-          files: artifacts/**/*.rpm
+          name: rpm-aarch64
+          path: artifacts
+      - name: Upload aarch64 RPMs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ startsWith(env.RELEASE_VERSION, 'v') && env.RELEASE_VERSION || format('v{0}', env.RELEASE_VERSION) }}
+        run: |
+          gh release view "$TAG_NAME" >/dev/null 2>&1 || \
+            gh release create "$TAG_NAME" --target "$GITHUB_SHA" --title "$TAG_NAME" --generate-notes || \
+            gh release view "$TAG_NAME" >/dev/null
+          gh release upload "$TAG_NAME" artifacts/**/*.rpm --clobber
+  upload-riscv64:
+    needs: build-riscv64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: rpm-riscv64
+          path: artifacts
+      - name: Upload riscv64 RPMs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ startsWith(env.RELEASE_VERSION, 'v') && env.RELEASE_VERSION || format('v{0}', env.RELEASE_VERSION) }}
+        run: |
+          gh release view "$TAG_NAME" >/dev/null 2>&1 || \
+            gh release create "$TAG_NAME" --target "$GITHUB_SHA" --title "$TAG_NAME" --generate-notes || \
+            gh release view "$TAG_NAME" >/dev/null
+          gh release upload "$TAG_NAME" artifacts/**/*.rpm --clobber
