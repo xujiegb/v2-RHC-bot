@@ -188,7 +188,7 @@ fn db(data: &PathBuf) -> Result<Connection> {
     let (_, p) = paths(data);
     let c = Connection::open(p)?;
     c.busy_timeout(std::time::Duration::from_secs(5))?;
-    c.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS pending(user_id INTEGER,chat_id INTEGER,deadline INTEGER,failures INTEGER DEFAULT 0,busy INTEGER DEFAULT 0,join_request INTEGER DEFAULT 0,PRIMARY KEY(user_id,chat_id)); CREATE TABLE IF NOT EXISTS whitelist(tg_id INTEGER PRIMARY KEY,created_at INTEGER NOT NULL);")?;
+    c.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS pending(user_id INTEGER,chat_id INTEGER,deadline INTEGER,failures INTEGER DEFAULT 0,busy INTEGER DEFAULT 0,join_request INTEGER DEFAULT 0,PRIMARY KEY(user_id,chat_id)); CREATE TABLE IF NOT EXISTS whitelist(tg_id INTEGER PRIMARY KEY,created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS approved_join(user_id INTEGER,chat_id INTEGER,expires INTEGER NOT NULL,PRIMARY KEY(user_id,chat_id));")?;
     let _ = c.execute(
         "ALTER TABLE pending ADD COLUMN join_request INTEGER DEFAULT 0",
         [],
@@ -216,6 +216,22 @@ fn whitelist_delete(data: &PathBuf, tg_id: i64) -> Result<usize> {
 }
 fn whitelist_clear(data: &PathBuf) -> Result<usize> {
     Ok(db(data)?.execute("DELETE FROM whitelist", [])?)
+}
+
+fn mark_approved_join(data: &PathBuf, user: i64, chat: i64, ttl_seconds: i64) -> Result<()> {
+    db(data)?.execute(
+        "INSERT OR REPLACE INTO approved_join(user_id,chat_id,expires) VALUES(?1,?2,?3)",
+        params![user, chat, now() + ttl_seconds],
+    )?;
+    Ok(())
+}
+fn consume_approved_join(data: &PathBuf, user: i64, chat: i64) -> Result<bool> {
+    let c = db(data)?;
+    c.execute("DELETE FROM approved_join WHERE expires<?1", [now()])?;
+    Ok(c.execute(
+        "DELETE FROM approved_join WHERE user_id=?1 AND chat_id=?2",
+        params![user, chat],
+    )? > 0)
 }
 fn whitelist_list(data: &PathBuf) -> Result<Vec<i64>> {
     let c = db(data)?;
@@ -261,6 +277,25 @@ async fn ban(c: &Client, t: &str, chat: i64, user: i64) {
         json!({"chat_id":chat,"user_id":user,"revoke_messages":true}),
     )
     .await;
+}
+async fn send_welcome(
+    c: &Client,
+    t: &str,
+    chat: i64,
+    member: &Value,
+    cfg: &Config,
+    username: &str,
+    include_button: bool,
+) -> Result<()> {
+    let welcome = welcome_text(&cfg.welcome, member);
+    let mut body = json!({"chat_id":chat,"text":welcome});
+    if include_button {
+        body["reply_markup"] = json!({
+            "inline_keyboard":[[{"text":cfg.button,"url":format!("https://t.me/{username}?start=verify")}]]
+        });
+    }
+    api(c, t, "sendMessage", body).await?;
+    Ok(())
 }
 async fn is_chat_admin(c: &Client, t: &str, chat: i64, user: i64) -> Result<bool> {
     let member = api(
@@ -386,6 +421,7 @@ async fn verify(
     org: String,
     fail: i64,
     join_request: bool,
+    bot_username: String,
 ) -> Result<()> {
     // UBI 10 contains subscription-manager but not rhc. Both accepted input
     // syntaxes are normalized to this command, while credentials remain on stdin.
@@ -426,6 +462,7 @@ async fn verify(
         params![user, chat],
     )?;
     if join_request {
+        mark_approved_join(&data, user, chat, cfg.timeout_seconds as i64)?;
         api(
             &c,
             &cfg.token,
@@ -433,6 +470,26 @@ async fn verify(
             json!({"chat_id":chat,"user_id":user}),
         )
         .await?;
+        if let Ok(member) = api(
+            &c,
+            &cfg.token,
+            "getChatMember",
+            json!({"chat_id":chat,"user_id":user}),
+        )
+        .await
+        {
+            let welcome_member = member.get("user").unwrap_or(&member);
+            send_welcome(
+                &c,
+                &cfg.token,
+                chat,
+                welcome_member,
+                &cfg,
+                &bot_username,
+                false,
+            )
+            .await?;
+        }
     } else {
         api(&c,&cfg.token,"restrictChatMember",json!({"chat_id":chat,"user_id":user,"permissions":{"can_send_messages":true,"can_send_audios":true,"can_send_documents":true,"can_send_photos":true,"can_send_videos":true,"can_send_video_notes":true,"can_send_voice_notes":true,"can_send_polls":true,"can_send_other_messages":true,"can_add_web_page_previews":true,"can_invite_users":true}})).await?;
     }
@@ -510,6 +567,7 @@ async fn run(data: PathBuf) -> Result<()> {
                     continue;
                 }
                 if is_whitelisted(&data, uid)? {
+                    mark_approved_join(&data, uid, chat, cfg.timeout_seconds as i64)?;
                     let _ = api(
                         &client,
                         &cfg.token,
@@ -517,6 +575,7 @@ async fn run(data: PathBuf) -> Result<()> {
                         json!({"chat_id":chat,"user_id":uid}),
                     )
                     .await;
+                    send_welcome(&client, &cfg.token, chat, user, &cfg, &username, false).await?;
                     continue;
                 }
                 db(&data)?.execute(
@@ -569,15 +628,11 @@ async fn run(data: PathBuf) -> Result<()> {
                     continue;
                 }
                 let uid = member["id"].as_i64().unwrap();
+                if consume_approved_join(&data, uid, chat)? {
+                    continue;
+                }
                 if is_whitelisted(&data, uid)? {
-                    let welcome = welcome_text(&cfg.welcome, member);
-                    api(
-                        &client,
-                        &cfg.token,
-                        "sendMessage",
-                        json!({"chat_id":chat,"text":welcome}),
-                    )
-                    .await?;
+                    send_welcome(&client, &cfg.token, chat, member, &cfg, &username, false).await?;
                     continue;
                 }
                 db(&data)?.execute(
@@ -585,8 +640,7 @@ async fn run(data: PathBuf) -> Result<()> {
                     params![uid, chat, now() + cfg.timeout_seconds as i64, 0],
                 )?;
                 api(&client,&cfg.token,"restrictChatMember",json!({"chat_id":chat,"user_id":uid,"permissions":{"can_send_messages":false},"until_date":now()+cfg.timeout_seconds as i64})).await?;
-                let welcome = welcome_text(&cfg.welcome, member);
-                api(&client,&cfg.token,"sendMessage",json!({"chat_id":chat,"text":welcome,"reply_markup":{"inline_keyboard":[[{"text":cfg.button,"url":format!("https://t.me/{username}?start=verify")}]]}})).await?;
+                send_welcome(&client, &cfg.token, chat, member, &cfg, &username, true).await?;
             }
             if m["chat"]["type"] != "private" {
                 continue;
@@ -674,6 +728,7 @@ async fn run(data: PathBuf) -> Result<()> {
             let task_data = data.clone();
             let task_client = client.clone();
             let task_cfg = cfg.clone();
+            let task_username = username.clone();
             tokio::spawn(async move {
                 if let Err(e) = verify(
                     task_data.clone(),
@@ -685,6 +740,7 @@ async fn run(data: PathBuf) -> Result<()> {
                     org,
                     fail,
                     join_request == 1,
+                    task_username,
                 )
                 .await
                 {
@@ -955,6 +1011,15 @@ mod tests {
         assert!(!is_whitelisted(&data, 123456).unwrap());
         assert_eq!(whitelist_clear(&data).unwrap(), 1);
         assert!(whitelist_list(&data).unwrap().is_empty());
+        let _ = fs::remove_dir_all(data);
+    }
+
+    #[test]
+    fn consumes_approved_join_once() {
+        let data = std::env::temp_dir().join(format!("rhc-bot-test-approved-{}", now()));
+        mark_approved_join(&data, 123456, -100100, 600).unwrap();
+        assert!(consume_approved_join(&data, 123456, -100100).unwrap());
+        assert!(!consume_approved_join(&data, 123456, -100100).unwrap());
         let _ = fs::remove_dir_all(data);
     }
 }
