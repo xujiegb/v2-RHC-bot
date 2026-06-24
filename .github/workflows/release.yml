@@ -101,6 +101,7 @@ jobs:
       - name: Upload x86_64 RPMs
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG_NAME: ${{ startsWith(env.RELEASE_VERSION, 'v') && env.RELEASE_VERSION || format('v{0}', env.RELEASE_VERSION) }}
         run: |
           gh release view "$TAG_NAME" >/dev/null 2>&1 || \
@@ -118,6 +119,7 @@ jobs:
       - name: Upload aarch64 RPMs
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG_NAME: ${{ startsWith(env.RELEASE_VERSION, 'v') && env.RELEASE_VERSION || format('v{0}', env.RELEASE_VERSION) }}
         run: |
           gh release view "$TAG_NAME" >/dev/null 2>&1 || \
@@ -135,6 +137,7 @@ jobs:
       - name: Upload riscv64 RPMs
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           TAG_NAME: ${{ startsWith(env.RELEASE_VERSION, 'v') && env.RELEASE_VERSION || format('v{0}', env.RELEASE_VERSION) }}
         run: |
           gh release view "$TAG_NAME" >/dev/null 2>&1 || \
